@@ -1,4 +1,4 @@
-# Transformer based on the structure of the decoder block of the Attention is All You Need paper (with pre-norm)
+# Char-level transformer based on the structure of the decoder block of the Attention Is All You Need paper (with pre-norm)
 
 import torch
 import torch.nn as nn
@@ -6,13 +6,16 @@ from torch.nn import functional as F
 
 # hyperparams
 batch_size = 32 # how many sequences (blocks) are processed at once, B
-block_size = 8 # maximum context length for predictions (how many token positions each sequence has, T)
+block_size = 128 # maximum context length for predictions (how many token positions each sequence has, T)
 max_iters = 5000
 eval_interval = max_iters / 10
-learning_rate = 1e-3
+learning_rate = 1e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
-n_embd = 32 # how many numbers represent each token at each position (sometimes C, othertimes C is vocab_size)
+n_embd = 128 # how many numbers represent each token at each position (sometimes C, othertimes C is vocab_size)
+n_head = 4 # number of self-attention heads
+n_layer = 4 # number of layers in the block
+dropout = 0.2 # prob of dropout (prevents overfitting)
 
 torch.manual_seed(1337)
 
@@ -68,6 +71,7 @@ class Head(nn.Module):
         self.value = nn.Linear(n_embd, head_size, bias=False)
         # as tril is not a param of the module and is instead what pytorch calls a buffer
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size))) # (T, T)
+        self.dropout = nn.Dropout(dropout) # randomly zeroes some of the elements of the input tensor with probability 'dropout'
 
     def forward(self, x):
         B, T, C = x.shape
@@ -92,6 +96,7 @@ class MultiAttentionHead(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
         self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout) # randomly zeroes some of the elements of the input tensor with probability 'dropout'
 
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
@@ -100,7 +105,7 @@ class MultiAttentionHead(nn.Module):
 
 
 class FeedForward(nn.Module):
-    """Simple linear layer followed by a non-linearity"""
+    """Simple linear layer followed by a non-linearity and dropout"""
 
     def __init__(self, n_embd):
         super().__init__()
@@ -108,6 +113,7 @@ class FeedForward(nn.Module):
             nn.Linear(n_embd, 4*n_embd), # 4* is based on attention is all you need paper
             nn.ReLU(),
             nn.Linear(4*n_embd, n_embd), # the projection layer of the residual connections
+            nn.Dropout(dropout), # randomly zeroes some of the elements of the input tensor with probability 'dropout'
         )
 
     def forward(self, x):
@@ -136,19 +142,15 @@ class Block(nn.Module):
         return x
 
 
-class BigramLanguageModel(nn.Module):
+class TransformerLanguageModel(nn.Module):
 
     def __init__(self):
         super().__init__()
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding_table = nn.Embedding(block_size, n_embd) # not doing anything in a bigram model?
-        self.blocks = nn.Sequential(
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-            nn.LayerNorm(n_embd),
-        )
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd) # final layer-norm
         self.lm_head = nn.Linear(n_embd, vocab_size) # language model head
     
     def forward(self, idx, targets=None):
@@ -175,15 +177,17 @@ class BigramLanguageModel(nn.Module):
         for _ in range(max_new_tokens):
             cond_idx = idx[:, -block_size:] # crop idx to the last block_size tokens as we only have positional embds for up to block_size context length
             logits, loss = self(cond_idx) # get the predictions
-            logits = logits[:,-1,:] # keep only the logits from the last time step, since only those predict the next token in a bigram model -> (B, C)
+            logits = logits[:,-1,:] # keep only the logits from the last time step, as last-position logits are used because this is an autoregressive language model -> (B, C)
             probs = F.softmax(logits, dim=-1) # (B, C)
             idx_next = torch.multinomial(probs, num_samples=1) # sample from distribution (B, 1)
             idx = torch.cat((idx, idx_next), dim=1) # append sample index along 1st (time) dim -> (B, T+1)
         return idx
 
 
-model = BigramLanguageModel()
+model = TransformerLanguageModel()
 m = model.to(device)
+# print the number of parameters in the model
+print(sum(p.numel() for p in m.parameters()),' parameters')
 
 # create the optimiser
 optimizer = torch.optim.AdamW(m.parameters(), lr=learning_rate)
